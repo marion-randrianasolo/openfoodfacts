@@ -30,30 +30,47 @@ public class OpenFoodFacts {
 
     public static void main(String[] args) {
     	
+        // Initialize a Properties object to load configuration settings
     	Properties props = new Properties();
     	InputStream is = null;
     	try {
+            // Load the application.properties file
     	    is = OpenFoodFacts.class.getClassLoader().getResourceAsStream("application.properties");
     	    props.load(is);
     	} catch (IOException e) {
-    	    // Gérer l'exception
+    		e.printStackTrace();
     	} finally {
     	    if (is != null) {
     	        try {
     	            is.close();
     	        } catch (IOException e) {
-    	            // Gérer l'exception
+    	            e.printStackTrace();
     	        }
     	    }
     	}
 
+        // Retrieve the database password from the loaded properties
     	String dbPassword = props.getProperty("db.password");
     	
+        // Create a SparkSession with a specified app name and run it locally using 3 worker threads
         SparkSession sparkSession = SparkSession.builder().appName("OpenFoodFacts Data").master("local[3]").getOrCreate();
+        // Set log level to WARN to reduce the amount of log output
         sparkSession.sparkContext().setLogLevel("WARN");
+        
+        // Database connection properties
+        Properties connectionProperties = new Properties();
+        connectionProperties.put("user", "root");
+        connectionProperties.put("password", dbPassword);
+  
+        // JDBC URL for connecting to the database
+        String jdbcUrl = "jdbc:mysql://localhost:3306/openfoodfacts?useSSL=false&characterEncoding=UTF-8";
+        // Initialize the counter for daily menus based on existing data in the database
+        initializeCounterForDailyMenus(sparkSession, jdbcUrl, connectionProperties);
 
+        // Path to the CSV file containing openfoodfacts data
         String dataFile = "C:\\Users\\mario\\Downloads\\fr.openfoodfacts.org.products.csv";
 
+        // Load the CSV file into a DataFrame
         Dataset<Row> df = sparkSession.read()
                 .format("csv")
                 .option("header", "true")
@@ -62,10 +79,12 @@ public class OpenFoodFacts {
                 .option("charset", "UTF-8")
                 .load(dataFile);
 
+        // Print out the number of rows and the schema of the loaded DataFrame
         System.out.println("Nombre de lignes : " + df.count());
         System.out.println("Colonnes : " + Arrays.toString(df.columns()));
         System.out.println("Types de données : " + Arrays.toString(df.dtypes()));
 
+        // Filter the DataFrame based on certain columns and drop any rows with missing values
         Dataset<Row> filteredDataset = df.select(
                 df.col("product_name"),
                 df.col("categories"),
@@ -80,20 +99,19 @@ public class OpenFoodFacts {
                 df.col("fiber_100g").cast("float"),
                 df.col("proteins_100g").cast("float"),
                 df.col("salt_100g").cast("float")
-           // ).na().drop(new String[]{"product_name", "categories", "nutriscore_score", "energy-kcal_100g", "proteins_100g"});
-        		).na().drop();
-        
-       // filteredDataset.show();
-        
+        		).na().drop();           
         System.out.println("Filtered Dataset Rows: " + filteredDataset.count());
 
+        // Define a WindowSpec to order rows by product name
         WindowSpec window = Window.orderBy(col("product_name"));
-        Dataset<Row> indexedDataset = filteredDataset.withColumn("product_id", functions.row_number().over(window));
-
-     //  indexedDataset.show();
         
+        // Add a 'product_id' column to the DataFrame by assigning a unique ID to each row based on the window specification
+        Dataset<Row> indexedDataset = filteredDataset.withColumn("product_id", functions.row_number().over(window));
+        
+        // Path to the CSV file containing diet requirements
         String dataReqFile = "C:\\Users\\mario\\Downloads\\diet_requirements.csv";
-
+ 
+        // Load dietary requirements into a DataFrame
         Dataset<Row> dietRequirements = sparkSession.read()
             .format("csv")
             .option("header", "true")
@@ -111,45 +129,34 @@ public class OpenFoodFacts {
         // Filter DataFrame on products for Keto 
         Dataset<Row> ketoFriendlyProducts = indexedDataset.filter(col("carbohydrates_100g").lt(maxCarbsKeto)
             .and(col("fat_100g").gt(minFatKeto)));
-
         System.out.println("Keto Friendly Products:");
-    //    ketoFriendlyProducts.show();
-
+        
         // Filter DataFrame on products for LowCarb 
         Dataset<Row> lowCarbFriendlyProducts = indexedDataset.filter(col("carbohydrates_100g").lt(maxCarbsLowCarb));
-
         System.out.println("LowCarb Friendly Products:");
-     //   lowCarbFriendlyProducts.show();
 
         
-     // Chargez les données des utilisateurs
+        // Load CSV file containing user data
         String userFile = "C:\\Users\\mario\\Downloads\\user_dietary_preferences.csv";
         Dataset<Row> userData = sparkSession.read()
             .format("csv")
             .option("header", "true")
             .load(userFile);
         
-     // Configuration des propriétés de connexion à la base de données
-        Properties connectionProperties = new Properties();
-        connectionProperties.put("user", "root");
-        connectionProperties.put("password", dbPassword); // Assurez-vous de sécuriser votre mot de passe réel
-  
-     //   String jdbcUrl = "jdbc:mysql://b4cn7kipysfb3tfgheh3-mysql.services.clever-cloud.com:3306/b4cn7kipysfb3tfgheh3?useSSL=false&characterEncoding=UTF-8";
-
-        String jdbcUrl = "jdbc:mysql://localhost:3306/openfoodfacts_test?useSSL=false&characterEncoding=UTF-8";
+     
 
         
-        // Pour les produits Keto
+        // Write the filtered keto products in database
         writeToDatabase(ketoFriendlyProducts, "products", jdbcUrl, connectionProperties);
 
-        // Pour les produits LowCarb
+        // Write the filtered lowcarb products in database
         writeToDatabase(lowCarbFriendlyProducts, "products", jdbcUrl, connectionProperties);
 
-        // pour insérer des utilisateurs
+        // Write user data from dataframe in database
         writeToDatabase(userData, "users", jdbcUrl, connectionProperties);
         
 
-        // Itérez sur chaque utilisateur pour générer un menu personnalisé
+        // Generate and write personalized weekly menus for each user.
         userData.collectAsList().forEach(user -> {
         	Integer userId = Integer.parseInt(user.getAs("user_id"));
             String userDietType = user.getAs("diet_type");
@@ -166,10 +173,12 @@ public class OpenFoodFacts {
             generateWeeklyMenu(sparkSession, userFriendlyProducts, userId, jdbcUrl, connectionProperties);
         });
                 
+        // Display content of "daily_menus" table.
         Dataset<Row> dbData = sparkSession.read()
         	    .jdbc(jdbcUrl, "daily_menus", connectionProperties);
         	dbData.show();
 
+       	// End of session.
         System.out.println("--- Session over ---");
         sparkSession.stop();
 
@@ -197,7 +206,7 @@ public class OpenFoodFacts {
             new StructField("product_ids", DataTypes.StringType, false, Metadata.empty())
         });
 
-      //  dailyMenu.show();
+        dailyMenu.show();
 
         // Create a DataFrame with the menu information
         return spark.createDataFrame(Arrays.asList(menuRow), menuSchema);
@@ -240,25 +249,42 @@ public class OpenFoodFacts {
         
         // Write the weekly menu DataFrame to the database
         writeToDatabase(weeklyMenu, "weekly_menus", jdbcUrl, connectionProperties);
-       // weeklyMenu.show();
+        weeklyMenu.show();
 
     }
 
 
-    
+    // 	Write DataFrame to database table.
     private static void writeToDatabase(Dataset<Row> dataframe, String tableName, String jdbcUrl, Properties connectionProperties) {
-    	dataframe.write()
-        	.mode(SaveMode.Ignore) // Ignore records that cause primary key conflicts
-        	.jdbc(jdbcUrl, tableName, connectionProperties);
-        System.out.println("Data written to table: " + tableName);
-
+        try {
+            dataframe.write()
+                .mode(SaveMode.Append)
+                .jdbc(jdbcUrl, tableName, connectionProperties);
+            System.out.println("Data written to table: " + tableName);
+        } catch (Exception e) {
+            System.out.println("Exception while writing to table: " + tableName);
+            e.printStackTrace();
+        }
     }
     
-    private static final AtomicInteger counter = new AtomicInteger(50); // start from 1
+    // Initialize ID counter based on the highest ID in the 'daily_menus' table.
+    private static void initializeCounterForDailyMenus(SparkSession spark, String jdbcUrl, Properties connectionProperties) {
+        Dataset<Row> maxIdResult = spark.read().jdbc(jdbcUrl, "daily_menus", connectionProperties)
+                .agg(functions.max(col("menu_id")).alias("max_id"));
+        Integer maxId = maxIdResult.collectAsList().get(0).getAs("max_id");
+        if (maxId != null) {
+            counter.set(maxId + 1); // Set counter to max_id + 1.
+        } else {
+            counter.set(1);  // If no existing IDs, start counter at 1.
+        }
+    }
+    
+    // Counter to generate unique IDs, starting from 1.
+    private static final AtomicInteger counter = new AtomicInteger(1); // start from 1
 
+    // Generates and returns a unique ID.
     private static int generateUniqueMenuId() {
-        // Generate a sequential unique ID
-        return counter.getAndIncrement();
+        return counter.getAndIncrement(); // Increment and return counter.
     }
 
 }
